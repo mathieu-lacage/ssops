@@ -1,0 +1,594 @@
+#!/usr/bin/python3
+import argparse
+import collections
+import json
+import sys
+import getpass
+import os
+import base64
+import traceback
+import socket
+import secrets
+
+import yaml
+import cryptography.exceptions
+from cryptography.hazmat.primitives.ciphers import aead
+from cryptography.hazmat.primitives.kdf import scrypt
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
+
+Method = collections.namedtuple('Method', ['encrypt', 'decrypt'])
+
+
+class SshReadBuffer:
+    def __init__(self, buffer):
+        self._buffer = buffer
+        self._current = 0
+
+    def read_uint32(self):
+        value = int.from_bytes(self._buffer[self._current:self._current+4], byteorder='big')
+        self._current += 4
+        return value
+
+    def read_string(self):
+        length = self.read_uint32()
+        s = self._buffer[self._current:self._current+length]
+        self._current += length
+        return s
+
+
+class SshWriteBuffer:
+    def __init__(self):
+        self._bytes = []
+
+    def write_byte(self, b):
+        self._bytes.append(b.to_bytes(1))        
+
+    def write_uint32(self, value):
+        self._bytes.append(value.to_bytes(4, byteorder='big'))
+
+    def write_bytes(self, buffer):
+        if isinstance(buffer, SshWriteBuffer):
+            self._bytes.extend(buffer._bytes)
+        else:
+            self._bytes.append(buffer)
+
+    def write_string(self, buffer):
+        self.write_uint32(len(buffer))
+        self.write_bytes(buffer)
+
+    def to_bytes(self):
+        return b''.join(self._bytes)
+
+    def __len__(self):
+        return sum(len(b) for b in self._bytes)
+
+
+class SshAgent:
+    # https://datatracker.ietf.org/doc/html/draft-miller-ssh-agent
+    SSH_AGENTC_REQUEST_IDENTITIES = 11
+    SSH_AGENT_IDENTITIES_ANSWER = 12
+    SSH_AGENTC_SIGN_REQUEST = 13
+    SSH_AGENT_RSA_SHA2_256 = 0x02
+    SSH_AGENT_FAILURE = 5
+    Message = collections.namedtuple('Message', ['type', 'contents'])
+    Key = collections.namedtuple('Key', ['key', 'comment'])
+
+    def connect(self):
+        path = os.getenv('SSH_AUTH_SOCK')
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        self._sock = sock
+
+    def _send_request(self, type, buffer):
+        request = SshWriteBuffer()
+        request.write_uint32(len(buffer)+1)
+        request.write_byte(type)
+        request.write_bytes(buffer)
+        written = self._sock.send(request.to_bytes())
+        assert written == len(request.to_bytes())
+
+    def _recv_bytes(self, n):
+        remaining = n
+        data = []
+        while remaining > 0:
+            buffer = self._sock.recv(remaining)
+            if len(buffer) == 0:
+                raise Exception('fuck')
+            remaining -= len(buffer)
+            data.append(buffer)
+        return b''.join(data)
+
+    def _recv_message(self):
+        length = self._recv_bytes(4)
+        length = int.from_bytes(length, byteorder='big')
+        payload = self._recv_bytes(length)
+        return SshAgent.Message(type=payload[0], contents=payload[1:])
+
+    def list_identities(self):
+        self._send_request(SshAgent.SSH_AGENTC_REQUEST_IDENTITIES, b'')
+        rx = self._recv_message()
+        assert rx.type == SshAgent.SSH_AGENT_IDENTITIES_ANSWER
+        assert len(rx.contents) >= 4
+        buffer = SshReadBuffer(rx.contents)
+        nkeys = buffer.read_uint32()
+        for _ in range(nkeys):
+            key = buffer.read_string()
+            comment = buffer.read_string()
+            yield SshAgent.Key(key=key, comment=comment)
+
+    def sign(self, public_key, data):
+        request = SshWriteBuffer()
+        request.write_string(public_key)
+        request.write_string(data)
+        request.write_uint32(SshAgent.SSH_AGENT_RSA_SHA2_256)
+        self._send_request(SshAgent.SSH_AGENTC_SIGN_REQUEST, request)
+        message = self._recv_message()
+        if message.type == SshAgent.SSH_AGENT_FAILURE:
+            raise Exception('Unable to obtain signature from agent')
+        response = SshReadBuffer(message.contents)
+        length = response.read_uint32()
+        key_type = response.read_string()
+        signature = response.read_string()
+        return signature
+
+
+def _aes_gcm_encrypt(key, message):
+    nonce = secrets.token_bytes(12)
+    ciphertext = nonce + aead.AESGCM(key).encrypt(nonce, message, b"")
+    return ciphertext
+
+
+def _aes_gcm_decrypt(key, ciphertext):
+    message = aead.AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], b"")
+    return message
+
+
+def _kdf_encrypt(password, data):
+    kdf_configuration = {
+        'salt': secrets.token_bytes(16),
+        'length': 32,
+        'n': 2**20,
+        'r': 8,
+        'p': 1
+    }
+    kdf = scrypt.Scrypt(**kdf_configuration)
+    key = kdf.derive(password)
+    encrypted = _aes_gcm_encrypt(key, data)
+    kdf_configuration['salt'] = kdf_configuration['salt'].hex()
+    return {
+        'type': 'scrypt-aes-gcm',
+        'scrypt': kdf_configuration,
+        'ciphertext': encrypted.hex()
+    }
+
+def _kdf_decrypt(password, encrypted):
+    assert 'type' in encrypted
+    if 'type' not in encrypted:
+        raise Exception(f'Missing "type" field in {encrypted}')
+    if encrypted['type'] == 'scrypt-aes-gcm':
+        kdf_configuration = encrypted['scrypt']
+        kdf_configuration['salt'] = bytes.fromhex(kdf_configuration['salt'])
+        kdf = scrypt.Scrypt(**kdf_configuration)
+        key = kdf.derive(password)
+        try:
+            decrypted = _aes_gcm_decrypt(key, bytes.fromhex(encrypted['ciphertext']))
+        except cryptography.exceptions.InvalidTag:
+            raise Exception('Invalid password')
+    else:
+        raise Exception(f'Unknown kdf type={encrypted["type"]}')
+    return decrypted
+
+
+def _parse_ssh_key(data):
+    tmp = data.split(' ')
+    if len(tmp) < 2:
+        raise Exception(f'Invalid public key {data}')
+    public_key = base64.b64decode(tmp[1])
+    return public_key
+
+
+def _ssh_agent_encrypt(ssh_agent_public_key, data):
+    with open(ssh_agent_public_key, 'r') as f:
+        key_data = f.read()
+    challenge = secrets.token_bytes(32)
+    agent = SshAgent()
+    agent.connect()
+    ssh_public_key = _parse_ssh_key(key_data)
+    signature = agent.sign(ssh_public_key, challenge)
+    encrypted_data = _kdf_encrypt(signature, data)
+    return {
+        'encrypted_private_key': encrypted_data,
+        'challenge': challenge.hex(),
+        'ssh_public_key': key_data
+    }
+
+
+def _ssh_agent_decrypt(encrypted):
+    agent = SshAgent()
+    agent.connect()
+    challenge = bytes.fromhex(encrypted['challenge'])
+    ssh_public_key = _parse_ssh_key(encrypted["ssh_public_key"])
+    signature = agent.sign(ssh_public_key, challenge)
+    decrypted_data = _kdf_decrypt(signature, encrypted['encrypted_private_key'])
+    return decrypted_data
+
+
+def _private_key_encrypt(name, ssh, private_key):
+    if ssh is None:
+        encrypted_private_key = _password_encrypt(private_key)
+        return {'type': 'password', 'name': name, 'data': encrypted_private_key}
+    else:
+        encrypted_private_key = _ssh_agent_encrypt(ssh_agent_public_key=ssh, data=private_key)
+        return {'type': 'ssh-agent', 'name': name, 'data': encrypted_private_key}
+
+
+def _private_key_decrypt(encrypted):
+    if 'type' not in encrypted:
+        raise Exception(f'Unable to identify type of key encryption: missing "type" field in {encrypted}')
+    if encrypted['type'] == 'password':
+        return _password_decrypt(encrypted['name'], encrypted['data'])
+    elif encrypted['type'] == 'ssh-agent':
+        return _ssh_agent_decrypt(encrypted['data'])
+    else:
+        raise Exception(f'Unsupported type={encrypted["type"]} of private key encryption')
+
+
+def _password_encrypt(data):
+    password = getpass.getpass('Password: ')
+    retyped_password = getpass.getpass('Retype password: ')
+    if password != retyped_password:
+        raise Exception('I am sorry but you did not type the same password twice.')
+    password = password.encode('utf-8')
+    return _kdf_encrypt(password, data)
+
+
+def _password_decrypt(name, encrypted):
+    password = getpass.getpass(f'Password for "{name}": ')
+    if password == '':
+        raise Exception(f'User did not attempt to decrypt key name={name}')
+    password = password.encode('utf-8')
+    decrypted = _kdf_decrypt(password, encrypted)
+    return decrypted
+
+
+def _load_private_key(config):
+    if 'encrypted_private_key' in config:
+        encrypted_private_key = config['encrypted_private_key']
+    else:
+        encrypted_private_key, public_key = _read_key(config['name'])
+        if public_key != config['public_key']:
+            raise Exception(f'Local key {config["name"]} has a public key that does not match the one used when then method file was created')
+    return encrypted_private_key
+
+
+def _rsa_encrypt(configuration, decrypted):
+    public_key = serialization.load_pem_public_key(configuration['public_key'].encode('ascii'))
+    ciphertext = public_key.encrypt(
+        decrypted,
+        padding.OAEP(
+            mgf=padding.MGF1(
+                algorithm=hashes.SHA256()
+            ),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    result = {
+        'ciphertext': ciphertext.hex(),
+        'configuration': configuration
+    }
+    return result
+
+
+
+def _rsa_decrypt(name, encrypted):
+    config = encrypted['configuration']
+    encrypted_private_key = _load_private_key(config)
+    decrypted_private_key = _private_key_decrypt(encrypted_private_key)
+    private_key = serialization.load_pem_private_key(
+        decrypted_private_key,
+        password=None
+    )
+    plaintext = private_key.decrypt(
+        bytes.fromhex(encrypted['ciphertext']),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return plaintext
+
+
+all_methods = {
+    'password': Method(encrypt=_password_encrypt, decrypt=_password_decrypt),
+    'rsa': Method(encrypt=_rsa_encrypt, decrypt=_rsa_decrypt)
+}
+
+
+def _read_input(input):
+    if input == '-':
+        data = sys.stdin.buffer.read()
+    else:
+        with open(input, 'rb') as f:
+            data = f.read()
+    return data
+
+
+def _write_output(output, data):
+    if output == '-':
+        sys.stdout.buffer.write(data)
+    else:
+        with open(output, 'wb+') as f:
+            f.write(data)
+            f.fsync()
+
+
+def _encrypt(args):
+    data = _read_input(args.input)
+
+    output = []
+    with open(args.method) as f:
+        configuration = yaml.safe_load(f)
+        for method_configuration in configuration['methods']:
+            if args.filter:
+                if method_configuration['name'] != args.filter:
+                    continue
+            method_type = method_configuration['type']
+            if method_type not in all_methods:
+                raise Exception(f'Unsupported encryption method: {method_type}')
+            encrypted = all_methods[method_type].encrypt(method_configuration, data) 
+            output.append({'type': method_type, 'name': method_configuration['name'], 'encrypted': encrypted})
+
+    _write_output(args.output, json.dumps(output).encode('ascii'))
+
+
+def _decrypt_one(method):
+    if 'type' not in method:
+        raise Exception(f'Invalid encrypted file: no "type" field in {method}')
+    if method['type'] not in all_methods:
+        raise Exception(f'Unsupported encryption method {method["type"]} name={method.get("name", "none")}')
+    if 'encrypted' not in method:
+        raise Exception(f'Invalid encrypted file: no "encrypted" field in {method}')
+    m = all_methods[method['type']]
+    decrypted = m.decrypt(method['name'], method['encrypted'])
+    return decrypted
+
+
+def _decrypt(args):
+    data = _read_input(args.input)
+    encrypted = json.loads(data)
+    failed = []
+    if args.filter:
+        encrypted = [method for method in encrypted if method['name'] == args.filter]
+    for method in encrypted:
+        try:
+            decrypted = _decrypt_one(method)
+            _write_output(args.output, decrypted)
+            break
+        except BaseException as e:
+            failed.append(e)
+    if len(failed) == len(encrypted):
+        if args.debug:
+            raise Exception(json.dumps([{'exception': traceback.format_exception(e)} for e in failed]))
+        else:
+            raise Exception(f'Unable to decrypt data:\n  {"\n  ".join([str(e) for e in failed])}')
+
+
+def _keydir():
+    return os.path.join(os.path.expanduser('~'), '.msops')
+
+
+def _write_key(name, data, force=False):
+    dirname = _keydir()
+    try:
+        os.mkdir(dirname)
+    except FileExistsError as e:
+        pass
+    filename = os.path.join(dirname, name)
+    if not force and os.path.isfile(filename):
+        raise Exception(f'Key {name} already exists. You cannot change a key after it has been created.')
+    with open(filename, 'wb+') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.fsync(os.open(dirname, os.O_DIRECTORY))
+
+
+def _read_key(name):
+    dirname = _keydir()
+    if not os.path.isdir(dirname):
+        raise Exception('Key directory does not exist. Create a key first.')
+    filename = os.path.join(dirname, name)
+    if not os.path.isfile(filename):
+        raise Exception(f'Key {name} does not exist. Create it first.')
+    with open(filename, 'r') as f:
+        private_key = json.load(f)
+    with open(f'{filename}.pub', 'r') as f:
+        public_key = f.read()
+    return private_key, public_key
+
+
+def _key_gen(args):
+    if args.type == 'rsa':
+        key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048
+        )
+        public_key = key.public_key().public_bytes(
+           encoding=serialization.Encoding.PEM,
+           format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        private_key = key.private_bytes(
+           encoding=serialization.Encoding.PEM,
+           format=serialization.PrivateFormat.TraditionalOpenSSL,
+           encryption_algorithm=serialization.NoEncryption()
+        )
+        encrypted_private_key = _private_key_encrypt(args.name, args.ssh, private_key)
+        _write_key(f'{args.name}.pub', public_key)
+        _write_key(f'{args.name}', json.dumps(encrypted_private_key).encode('ascii'))
+
+
+def _key_list(args):
+    def _list():
+        public_keys = {}
+        private_keys = {}
+        for filename in os.listdir(_keydir()):
+            if filename.endswith('.pub'):
+                public_keys[filename[:-4]] = 1
+            else:
+                private_keys[filename] = 1
+        for public_key in public_keys.keys():
+            if public_key in private_keys:
+                yield public_key
+    for key in _list():
+        print(key)
+
+
+def _key_check(args):
+    encrypted_private_key, public_key = _read_key(args.name)
+    decrypted_private_key = _private_key_decrypt(encrypted_private_key)
+    print('ok')
+
+
+def _key_protect(args):
+    encrypted_private_key, public_key = _read_key(args.name)
+    decrypted_private_key = _private_key_decrypt(encrypted_private_key)
+    re_encrypted_private_key = _private_key_encrypt(args.name, args.ssh, decrypted_private_key)
+    _write_key(f'{args.name}', json.dumps(re_encrypted_private_key).encode('ascii'), force=True)
+
+
+def _add_key_subparsers(top_parser):
+    key = top_parser.add_parser('key', help='')
+    subparsers = key.add_subparsers(required=True)
+
+    gen = subparsers.add_parser('gen', help='')
+    gen.add_argument('name', help='Name of key')
+    gen.add_argument('-t', '--type', choices=['rsa'], default='rsa')
+    gen.add_argument('--ssh', default=None, help='Path to ssh public key file to use to encrypt this key')
+    gen.set_defaults(func=_key_gen)
+
+    check = subparsers.add_parser('check', help='')
+    check.add_argument('name', help='Name of key')
+    check.set_defaults(func=_key_check)
+
+    protect = subparsers.add_parser('protect', help='')
+    protect.add_argument('name', help='Name of key')
+    # XXX add exclusive group
+    #protect.
+    protect.add_argument('--ssh', default=None, help='Path to ssh public key file to use to encrypt this key')
+    protect.add_argument('--password', default=None)
+    protect.set_defaults(func=_key_protect)
+
+    list_keys = subparsers.add_parser('list', help='List keys')
+    list_keys.set_defaults(func=_key_list)
+
+
+def _method_create(args):
+    _write_method(args.method, {'methods': []})
+
+
+def _write_method(filename, method):
+    with open(filename, 'w+') as f:
+        yaml.dump(method, f)
+
+
+def _read_method(filename):
+    with open(filename, 'r') as f:
+        method = yaml.safe_load(f)
+        return method
+
+def _format_table(rows):
+    cols = [[]] * len(rows[0])
+    for row in rows:
+        for i, cell in enumerate(row):
+            cols[i].append(cell)
+    col_lengths = [max(len(cell) for cell in col) for col in cols]
+    output = [' | '.join([cell.ljust(col_lengths[i]) for i, cell in enumerate(row)]) for row in rows]
+    width = max(len(row) for row in output)
+    output = [output[0]] + ['-' * width] + output[1:]
+    return '\n'.join(output)
+
+
+def _method_show(args):
+    method = _read_method(args.method)
+    output = [('name', 'type', 'embedded ?')]
+    for m in method['methods']:
+        output.append((m['name'], m['type'], 'yes' if m.get('encrypted_private_key') else 'no'))
+    print(_format_table(output))
+
+
+def _method_add_key(args):
+    encrypted_private_key, public_key = _read_key(args.key)
+    method = _read_method(args.method)
+    already_in = {(m['type'], m['name']) for m in method['methods']}
+    if ('rsa', args.key) in already_in:
+        raise BaseException(f'Already added key "{args.key}"')
+    one_method = {
+        'type': 'rsa',
+        'name': args.key,
+        'public_key': public_key
+    }
+    if args.embed:
+        one_method['encrypted_private_key'] = encrypted_private_key
+    method['methods'].append(one_method)
+    _write_method(args.method, method)
+
+
+def _add_method_subparsers(top_parser):
+    method = top_parser.add_parser('method', help='')
+    method.add_argument('method', help='Name of method file')
+    subparsers = method.add_subparsers(required=True)
+
+    create = subparsers.add_parser('create', help='')
+    create.set_defaults(func=_method_create)
+
+    show = subparsers.add_parser('show', help='')
+    show.set_defaults(func=_method_show)
+
+    add_key = subparsers.add_parser('add-key', help='Add key to encryption methods')
+    add_key.add_argument('key', help='Name of key to add')
+    add_key.add_argument('-e', '--embed', action='store_true', help='Embed encrypted private key in output to allow decryption on another host')
+    add_key.set_defaults(func=_method_add_key)
+
+
+def main():
+    parser = argparse.ArgumentParser('msops')
+    parser.add_argument('-d', '--debug', action='store_true')
+    subparsers = parser.add_subparsers(required=True)
+
+    encrypt = subparsers.add_parser('encrypt', help='')
+    encrypt.add_argument('method', help='Method file')
+    encrypt.add_argument('-f', '--filter', default=None)
+    encrypt.add_argument('-i', '--input', default='-')
+    encrypt.add_argument('-o', '--output', default='-')
+    encrypt.set_defaults(func=_encrypt)
+
+    decrypt = subparsers.add_parser('decrypt', help='')
+    decrypt.add_argument('-f', '--filter', default=None)
+    decrypt.add_argument('-i', '--input', default='-')
+    decrypt.add_argument('-o', '--output', default='-')
+    decrypt.set_defaults(func=_decrypt)
+
+    _add_key_subparsers(subparsers)
+
+    _add_method_subparsers(subparsers)
+
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+    except BaseException as e:
+        if args.debug:
+            error = json.dumps({'exception': traceback.format_exception(e)})
+        else:
+            error = str(e)
+        sys.stderr.write(error)
+        sys.stderr.write('\n')
+        sys.stderr.flush()
+
+
+main()
