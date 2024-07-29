@@ -1,13 +1,26 @@
-# What is ssops about ?
+# ssops
+
+ssops can manage shared secrets with encryption keys protected
+with ssh-agent to achieve passwordless encryption and decryption:
+
+```
+alex@local$ ssh-add ~/.ssh/id_rsa.pub
+alex@local$ ssops key gen alex --ssh ~/.ssh/id_rsa.pub
+alex@local$ ssops method dev create
+alex@local$ ssops method dev add-key alex
+alex@local$ echo "hello" | ssops encrypt ./dev | ssops decrypt
+```
+
+# What about sops, age and sshcrypt ?
 
 [sops](https://github.com/getsops/sops) & [age](https://github.com/FiloSottile/age) 
-are two tools used often to manage encryption and decryption of shared secrets.
-They are extremly useful if you have a KMS like HC Vault but if you do not,
+are often used to manage encryption and decryption of shared secrets.
+They are extremely useful if you have a KMS like HC Vault but if you do not,
 you are going to be typing your password a crazy number of times, especially if you like
 to store encrypted secrets in ansible vaults.
 
-[sshcrypt(https://github.com/leighmcculloch/sshcrypt) is another tool that
-allows you to encrypt and decrypt data with the ssh keys managed by your local 
+[sshcrypt](https://github.com/leighmcculloch/sshcrypt) is another tool that
+can encrypt and decrypt data with the ssh keys managed by your local 
 ssh-agent. 
 
 ssops puts together all these tools to allow you to easily encrypt and decrypt files securely,
