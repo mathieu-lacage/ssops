@@ -378,7 +378,7 @@ def _decrypt(args):
 
 
 def _keydir():
-    return os.path.join(os.path.expanduser('~'), '.msops')
+    return os.path.join(os.path.expanduser('~'), '.ssops')
 
 
 def _write_key(name, data, force=False):
@@ -555,7 +555,7 @@ def _add_method_subparsers(top_parser):
 
 
 def main():
-    parser = argparse.ArgumentParser('msops')
+    parser = argparse.ArgumentParser('ssops')
     parser.add_argument('-d', '--debug', action='store_true')
     subparsers = parser.add_subparsers(required=True)
 
