@@ -150,7 +150,7 @@ def _kdf_encrypt(password, data):
     kdf_configuration = {
         'salt': secrets.token_bytes(16),
         'length': 32,
-        'n': 2**20,
+        'n': 2**14,
         'r': 8,
         'p': 1
     }
@@ -304,7 +304,6 @@ def _rsa_decrypt(name, encrypted):
 
 
 all_methods = {
-    'password': Method(encrypt=_password_encrypt, decrypt=_password_decrypt),
     'rsa': Method(encrypt=_rsa_encrypt, decrypt=_rsa_decrypt)
 }
 
