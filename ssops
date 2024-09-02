@@ -264,7 +264,7 @@ def _load_private_key(config):
     return encrypted_private_key
 
 
-def _rsa_encrypt(configuration, decrypted):
+def _pem_encrypt(configuration, decrypted):
     public_key = serialization.load_pem_public_key(configuration['public_key'].encode('ascii'))
     ciphertext = public_key.encrypt(
         decrypted,
@@ -283,8 +283,7 @@ def _rsa_encrypt(configuration, decrypted):
     return result
 
 
-
-def _rsa_decrypt(name, encrypted):
+def _pem_decrypt(name, encrypted):
     config = encrypted['configuration']
     encrypted_private_key = _load_private_key(config)
     decrypted_private_key = _private_key_decrypt(encrypted_private_key)
@@ -303,8 +302,25 @@ def _rsa_decrypt(name, encrypted):
     return plaintext
 
 
+def _rsa_encrypt(configuration, decrypted):
+    return _pem_encrypt(configuration, decrypted)
+
+
+def _rsa_decrypt(name, encrypted):
+    return _pem_decrypt(name, encrypted)
+
+
+def _ed25519_encrypt(configuration, decrypted):
+    return _pem_encrypt(configuration, decrypted)
+
+
+def _ed25519_decrypt(name, encrypted):
+    return _pem_decrypt(name, encrypted)
+
+
 all_methods = {
-    'rsa': Method(encrypt=_rsa_encrypt, decrypt=_rsa_decrypt)
+    'rsa': Method(encrypt=_rsa_encrypt, decrypt=_rsa_decrypt),
+    'ed25519': Method(encrypt=_ed25519_encrypt, decrypt=_ed25519_decrypt)
 }
 
 
@@ -520,6 +536,48 @@ def _method_show(args):
     print(_format_table(output))
 
 
+def _read_public_key(filename):
+    if os.path.isfile(filename):
+        with open(filename) as f:
+            data = f.read()
+
+
+def _method_add_ssh_pubkey(args):
+    if not args.filename.endswith('.pub'):
+        raise Exception(f'Filename does not end with .pub: {args.filename}')
+    if not os.path.isfile(args.filename):
+        raise Exception(f'Unable to find {args.filename}')
+    with open(args.filename) as f:
+        public_key_data = f.read()
+    parts = public_key_data.split(' ')
+    if len(parts) not in [2, 3]:
+        raise Exception(f'Invalid ssh public key file {args.filename}')
+    ssh_type = parts[0]
+    if not ssh_type.startswith('ssh-'):
+        raise Exception(f'Invalid ssh public key file {args.filename}: no "ssh-TYPE " prefix')
+    match ssh_type:
+        case 'ssh-rsa':
+            type = 'rsa'
+        case 'ssh-ed25519':
+            type = 'ed25519'
+        case _:
+            raise Exception(f'Unsupported key type {ssh_type}')
+    public_key = serialization.load_ssh_public_key(public_key_data.encode('ascii'))
+    public_key_bytes = public_key.public_bytes(
+       encoding=serialization.Encoding.PEM,
+       format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    head, tail = os.path.split(args.filename)
+    one_method = {
+        'type': type,
+        'name': tail[-len('.pub')],
+        'public_key': public_key_bytes.decode('ascii')
+    }
+    method = _read_method(args.method)
+    method['methods'].append(one_method)
+    _write_method(args.method, method)
+
+
 def _method_add_key(args):
     encrypted_private_key, public_key = _read_key(args.key)
     method = _read_method(args.method)
@@ -547,6 +605,10 @@ def _add_method_subparsers(top_parser):
 
     show = subparsers.add_parser('show', help='Show the configuration of an existing method')
     show.set_defaults(func=_method_show)
+
+    add_ssh_pubkey = subparsers.add_parser('add-ssh-key', help='Add existing ssh key to encryption methods')
+    add_ssh_pubkey.add_argument('filename', help='SSH public key file')
+    add_ssh_pubkey.set_defaults(func=_method_add_ssh_pubkey)
 
     add_key = subparsers.add_parser('add-key', help='Add key to encryption methods')
     add_key.add_argument('key', help='Name of key to add')
