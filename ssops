@@ -538,14 +538,14 @@ def _method_add_key(args):
 
 
 def _add_method_subparsers(top_parser):
-    method = top_parser.add_parser('method', help='')
+    method = top_parser.add_parser('method', help='Manage a new or existing method')
     method.add_argument('method', help='Name of method file')
     subparsers = method.add_subparsers(required=True)
 
-    create = subparsers.add_parser('create', help='')
+    create = subparsers.add_parser('create', help='Create a new method')
     create.set_defaults(func=_method_create)
 
-    show = subparsers.add_parser('show', help='')
+    show = subparsers.add_parser('show', help='Show the configuration of an existing method')
     show.set_defaults(func=_method_show)
 
     add_key = subparsers.add_parser('add-key', help='Add key to encryption methods')
