@@ -264,18 +264,19 @@ def _load_private_key(config):
     return encrypted_private_key
 
 
+def _padding():
+    return padding.OAEP(
+        mgf=padding.MGF1(
+            algorithm=hashes.SHA256()
+        ),
+        algorithm=hashes.SHA256(),
+        label=None
+    )
+
+
 def _pem_encrypt(configuration, decrypted):
     public_key = serialization.load_pem_public_key(configuration['public_key'].encode('ascii'))
-    ciphertext = public_key.encrypt(
-        decrypted,
-        padding.OAEP(
-            mgf=padding.MGF1(
-                algorithm=hashes.SHA256()
-            ),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
+    ciphertext = public_key.encrypt(decrypted, _padding())
     result = {
         'ciphertext': ciphertext.hex(),
         'configuration': configuration
@@ -291,15 +292,39 @@ def _pem_decrypt(name, encrypted):
         decrypted_private_key,
         password=None
     )
-    plaintext = private_key.decrypt(
-        bytes.fromhex(encrypted['ciphertext']),
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
+    plaintext = private_key.decrypt(bytes.fromhex(encrypted['ciphertext']), _padding())
     return plaintext
+
+
+def _ssh_decrypt(name, public_key, encrypted):
+    home = os.path.expanduser('~/.ssh')
+    for filename in os.listdir(home):
+        if not filename.endswith('.pub'):
+            continue
+        full_pathname = os.path.join(home, filename)
+        with open(full_pathname + ',pub') as f:
+            ssh_public_key = f.read()
+        if ssh_public_key != public_key:
+            continue
+        with open(full_pathname, 'rb') as f:
+            data = f.read()
+        password = getpass.getpass(f'Password for "{name}": ')
+        if password == '':
+            raise Exception(f'User did not attempt to decrypt key name={name}')
+        password = password.encode('utf-8')
+        private_key = serialization.load_ssh_private_key(data, password)
+        plaintext = private_key.decrypt(bytes.fromhex(encrypted['ciphertext']), _padding())
+        return plaintext
+
+
+def _pem_or_ssh_decrypt(name, encrypted):
+    config = encrypted['configuration']
+    if 'encrypted_private_key' in config:
+        return _pem_decrypt(name, encrypted)
+    decrypted = _ssh_decrypt(name, config['public_key'], encrypted)
+    if decrypted is not None:
+        return decrypted
+    return _pem_decrypt(name, encrypted)
 
 
 def _rsa_encrypt(configuration, decrypted):
@@ -310,17 +335,8 @@ def _rsa_decrypt(name, encrypted):
     return _pem_decrypt(name, encrypted)
 
 
-def _ed25519_encrypt(configuration, decrypted):
-    return _pem_encrypt(configuration, decrypted)
-
-
-def _ed25519_decrypt(name, encrypted):
-    return _pem_decrypt(name, encrypted)
-
-
 all_methods = {
     'rsa': Method(encrypt=_rsa_encrypt, decrypt=_rsa_decrypt),
-    'ed25519': Method(encrypt=_ed25519_encrypt, decrypt=_ed25519_decrypt)
 }
 
 
@@ -559,7 +575,7 @@ def _method_add_ssh_pubkey(args):
         case 'ssh-rsa':
             type = 'rsa'
         case 'ssh-ed25519':
-            type = 'ed25519'
+            raise Exception('Unsupported signature with ed25519 keys')
         case _:
             raise Exception(f'Unsupported key type {ssh_type}')
     public_key = serialization.load_ssh_public_key(public_key_data.encode('ascii'))
